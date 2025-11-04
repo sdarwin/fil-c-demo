@@ -1,0 +1,169 @@
+# Copyright 2025 Sam Darwin
+#
+# Distributed under the Boost Software License, Version 1.0.
+# (See accompanying file LICENSE_1_0.txt or copy at http://boost.org/LICENSE_1_0.txt)
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+      - develop
+      - feature/**
+
+env:
+  DEFAULT_BUILD_VARIANT: debug,release
+
+jobs:
+  posix:
+    defaults:
+      run:
+        shell: bash
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux, gcc
+          - os: ubuntu-latest
+            container: ubuntu:24.04
+            install:
+              - clang
+              - xz-utils
+              - sudo
+
+    timeout-minutes: 45
+    runs-on: ${{matrix.os}}
+    container: ${{matrix.container}}
+
+    steps:
+      - name: Setup environment
+        run: |
+            if [ -f "/etc/debian_version" ]
+            then
+                echo "DEBIAN_FRONTEND=noninteractive" >> $GITHUB_ENV
+                export DEBIAN_FRONTEND=noninteractive
+            fi
+            if [ -n "${{matrix.container}}" ]
+            then
+                echo "GHA_CONTAINER=${{matrix.container}}" >> $GITHUB_ENV
+                if [ -f "/etc/debian_version" ]
+                then
+                    # Use Azure APT mirrors in containers to avoid HTTP errors due to DDoS filters triggered by lots of CI jobs launching concurrently.
+                    # Note that not all Ubuntu versions support "mirror+file:..." URIs in APT sources, so just use Azure mirrors exclusively.
+                    # Note also that on recent Ubuntu versions DEB822 format is used for source files.
+                    APT_SOURCES=()
+                    if [ -d "/etc/apt/sources.list.d" ]
+                    then
+                        readarray -t APT_SOURCES < <(find "/etc/apt/sources.list.d" -type f -name '*.sources' -print)
+                    fi
+                    if [ -f "/etc/apt/sources.list" ]
+                    then
+                        APT_SOURCES+=("/etc/apt/sources.list")
+                    fi
+                    if [ "${#APT_SOURCES[@]}" -gt 0 ]
+                    then
+                        sed -i -E -e 's!([^ ]+) (http|https)://(archive|security)\.ubuntu\.com/ubuntu[^ ]*(.*)!\1 http://azure.archive.ubuntu.com/ubuntu/\4!' "${APT_SOURCES[@]}"
+                    fi
+                    apt-get -o Acquire::Retries=$NET_RETRY_COUNT update
+                    if [ "$(apt-cache search "^python-is-python3$" | wc -l)" -ne 0 ]
+                    then
+                        PYTHON_PACKAGE="python-is-python3"
+                    else
+                        PYTHON_PACKAGE="python"
+                    fi
+                    # Fuller list:
+                    # apt-get -o Acquire::Retries=$NET_RETRY_COUNT install -y sudo software-properties-common tzdata wget curl apt-transport-https ca-certificates make build-essential g++ $PYTHON_PACKAGE python3 perl git cmake
+                    apt-get -o Acquire::Retries=$NET_RETRY_COUNT install -y git sudo software-properties-common tzdata wget curl apt-transport-https ca-certificates
+                fi
+            fi
+            git config --global pack.threads 0
+
+      - name: Install packages
+        if: matrix.install
+        run: |
+            declare -a SOURCE_KEYS SOURCES
+            if [ -n "${{join(matrix.source_keys, ' ')}}" ]
+            then
+                SOURCE_KEYS=("${{join(matrix.source_keys, '" "')}}")
+            fi
+            if [ -n "${{join(matrix.sources, ' ')}}" ]
+            then
+                SOURCES=("${{join(matrix.sources, '" "')}}")
+            fi
+            for key in "${SOURCE_KEYS[@]}"
+            do
+                for i in {1..$NET_RETRY_COUNT}
+                do
+                    echo "Adding key: $key"
+                    wget -O - "$key" | sudo apt-key add - && break || sleep 2
+                done
+            done
+            if [ ${#SOURCES[@]} -gt 0 ]
+            then
+                APT_ADD_REPO_COMMON_ARGS=("-y")
+                APT_ADD_REPO_SUPPORTED_ARGS="$(apt-add-repository --help | perl -ne 'if (/^\s*-n/) { print "n"; } elsif (/^\s*-P/) { print "P"; } elsif (/^\s*-S/) { print "S"; } elsif (/^\s*-U/) { print "U"; }')"
+                if [ -n "$APT_ADD_REPO_SUPPORTED_ARGS" -a -z "${APT_ADD_REPO_SUPPORTED_ARGS##*n*}" ]
+                then
+                    APT_ADD_REPO_COMMON_ARGS+=("-n")
+                fi
+                APT_ADD_REPO_HAS_SOURCE_ARGS="$([ -n "$APT_ADD_REPO_SUPPORTED_ARGS" -a -z "${APT_ADD_REPO_SUPPORTED_ARGS##*P*}" -a -z "${APT_ADD_REPO_SUPPORTED_ARGS##*S*}" -a -z "${APT_ADD_REPO_SUPPORTED_ARGS##*U*}" ] && echo 1 || echo 0)"
+                for source in "${SOURCES[@]}"
+                do
+                    for i in {1..$NET_RETRY_COUNT}
+                    do
+                        APT_ADD_REPO_ARGS=("${APT_ADD_REPO_COMMON_ARGS[@]}")
+                        if [ $APT_ADD_REPO_HAS_SOURCE_ARGS -ne 0 ]
+                        then
+                            case "$source" in
+                            "ppa:"*)
+                                APT_ADD_REPO_ARGS+=("-P")
+                                ;;
+                            "deb "*)
+                                APT_ADD_REPO_ARGS+=("-S")
+                                ;;
+                            *)
+                                APT_ADD_REPO_ARGS+=("-U")
+                                ;;
+                            esac
+                        fi
+                        APT_ADD_REPO_ARGS+=("$source")
+                        echo "apt-add-repository ${APT_ADD_REPO_ARGS[@]}"
+                        sudo -E apt-add-repository "${APT_ADD_REPO_ARGS[@]}" && break || sleep 2
+                    done
+                done
+            fi
+            sudo apt-get -o Acquire::Retries=$NET_RETRY_COUNT update
+            sudo apt-get -o Acquire::Retries=$NET_RETRY_COUNT install -y ${{join(matrix.install, ' ')}}
+
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Install fil-c
+        run: |
+            set -xe
+            mkdir -p /opt/downloads
+            cd /opt/downloads
+            fil_c_version="0.674"
+            wget "https://github.com/pizlonator/fil-c/releases/download/v${fil_c_version}/optfil-${fil_c_version}-linux-x86_64.tar.xz"
+            tar -xvJf "optfil-${fil_c_version}-linux-x86_64.tar.xz"
+            cd "optfil-${fil_c_version}-linux-x86_64"
+            echo -e "YES\nYES" | ./setup.sh
+
+      - name: Run tests
+        run: |
+            set -xe
+            export PATH=/opt/fil/bin:$PATH
+            maindir=$(pwd)
+            # Test 1
+            cd test1
+            filcc -o hello hello.c -g -O
+            ./hello
+            # Test 2
+            cd $maindir
+            cd test2
+            fil++ -o hello hello.cpp -g -O -std=c++20
+            ./hello
